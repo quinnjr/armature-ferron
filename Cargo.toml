@@ -1,12 +1,12 @@
 [package]
 name = "armature-ferron"
 version = "0.2.1"
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
+edition = "2024"
+rust-version = "1.94.1"
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-ferron"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "Ferron reverse proxy integration for Armature"
 keywords = ["ferron", "proxy", "reverse-proxy", "load-balancer"]
 categories = ["web-programming", "network-programming"]
