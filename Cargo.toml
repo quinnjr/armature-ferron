@@ -1,19 +1,19 @@
 [package]
 name = "armature-ferron"
-version = "0.2.1"
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
+version = "0.2.3"
+edition = "2024"
+rust-version = "1.94.1"
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-ferron"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "Ferron reverse proxy integration for Armature"
 keywords = ["ferron", "proxy", "reverse-proxy", "load-balancer"]
 categories = ["web-programming", "network-programming"]
 
 [dependencies]
 # Core dependencies
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -33,7 +33,7 @@ notify = "8.2"
 url = "2.5"
 
 # UUID for unique identifiers
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.26", features = ["v4"] }
 
 # Time utilities
 chrono = { version = "0.4", features = ["serde"] }
