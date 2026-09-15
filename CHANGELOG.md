@@ -9,13 +9,11 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
-### Fixed
-
-- Backend health checks run concurrently, so one backend hitting its timeout no longer delays every subsequent check or pushes the loop past its tick interval.
+## [0.2.3] - 2026-09-15
 
 ### Changed
 
-- Background health checks run all backends concurrently via `JoinSet`. Serially, one backend hitting `config.timeout` delayed every check behind it and could push a sweep past the tick interval.
+- Dependencies bumped to their latest releases: `tokio` 1.52 → 1.53, `uuid` 1.23 → 1.26.
 
 ## [0.2.2] - 2026-08-04
 
