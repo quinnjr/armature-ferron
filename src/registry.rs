@@ -3,6 +3,7 @@
 //! This module provides a service registry for dynamically discovering
 //! and managing backend services behind Ferron proxy.
 
+use crate::config::normalize_backend_url;
 use crate::error::{FerronError, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -107,7 +108,12 @@ impl ServiceRegistry {
     }
 
     /// Register a service instance with full configuration
-    pub async fn register_instance(&self, instance: ServiceInstance) -> Result<String> {
+    ///
+    /// The instance URL must be an `http`/`https` URL with a host; it is
+    /// stored in normalized form because it is later written into the
+    /// generated proxy configuration.
+    pub async fn register_instance(&self, mut instance: ServiceInstance) -> Result<String> {
+        instance.url = normalize_backend_url("instance.url", &instance.url)?;
         let service_name = instance.service_name.clone();
         let instance_id = instance.id.clone();
 
@@ -466,5 +472,29 @@ mod tests {
         assert_eq!(instance.weight, 3);
         assert_eq!(instance.metadata.get("version"), Some(&"1.0.0".to_string()));
         assert!(instance.tags.contains(&"production".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_non_http_and_injected_urls() {
+        let registry = ServiceRegistry::new();
+        assert!(
+            registry
+                .register("api", "file:///etc/passwd")
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .register("api", "http://h:1\"\n root \"/")
+                .await
+                .is_err()
+        );
+        assert!(registry.get_services().await.is_empty());
+
+        registry.register("api", "HTTP://Host:3000").await.unwrap();
+        assert_eq!(
+            registry.get_healthy_urls("api").await,
+            vec!["http://host:3000".to_string()]
+        );
     }
 }
