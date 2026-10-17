@@ -30,6 +30,128 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use url::Url;
 
+// ---------------------------------------------------------------------------
+// KDL output hardening
+//
+// Every value interpolated into the generated KDL goes through `kdl_str`
+// (quoted string) or one of the validators below (bare tokens). Without this,
+// a value such as `"/api\" {\n root \"/\"` in a backend URL, header, or
+// path closes the string early and injects arbitrary directives into the
+// proxy configuration.
+// ---------------------------------------------------------------------------
+
+/// Render `value` as a quoted KDL string.
+///
+/// `"` and `\` are escaped; any control character (CR, LF, NUL, TAB, ESC,
+/// ...) is rejected outright, since no legitimate value here contains one.
+pub(crate) fn kdl_str(field: &str, value: &str) -> Result<String> {
+    if let Some(c) = value.chars().find(|c| c.is_control()) {
+        return Err(FerronError::invalid_config(
+            field,
+            format!("contains control character U+{:04X}", c as u32),
+        ));
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+/// Parse and normalize a backend URL.
+///
+/// Only `http` and `https` with a host are accepted. The returned string is
+/// the parser's normalized serialization (`Url::as_str`), with the bare root
+/// path's trailing `/` dropped so `http://host:3000` stays `http://host:3000`.
+pub(crate) fn normalize_backend_url(field: &str, raw: &str) -> Result<String> {
+    if raw.chars().any(|c| c.is_control()) {
+        return Err(FerronError::invalid_config(
+            field,
+            "URL contains a control character",
+        ));
+    }
+    let url = Url::parse(raw)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(FerronError::invalid_config(
+            field,
+            format!(
+                "unsupported URL scheme `{}` (only http/https)",
+                url.scheme()
+            ),
+        ));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(FerronError::invalid_config(field, "URL has no host"));
+    }
+    let s = url.as_str();
+    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+        Ok(s.trim_end_matches('/').to_string())
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+/// Validate a route/location path: absolute, printable ASCII, and free of
+/// whitespace, quotes, backslashes, and `$` (which a `rewrite` replacement
+/// would treat as a backreference).
+pub(crate) fn validate_route_path(field: &str, path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        return Err(FerronError::invalid_config(
+            field,
+            "path must start with `/`",
+        ));
+    }
+    if let Some(c) = path
+        .chars()
+        .find(|c| !c.is_ascii_graphic() || matches!(c, '"' | '\\' | '$'))
+    {
+        return Err(FerronError::invalid_config(
+            field,
+            format!("path contains disallowed character {c:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an HTTP header name (RFC 9110 `token`).
+pub(crate) fn validate_header_name(field: &str, name: &str) -> Result<()> {
+    let is_tchar = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if name.is_empty() || !name.chars().all(is_tchar) {
+        return Err(FerronError::invalid_config(
+            field,
+            format!("invalid header name {name:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a server-block domain, which is emitted as a bare KDL node name.
+fn validate_domain(domain: &str) -> Result<()> {
+    let ok =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*' | ':' | '[' | ']');
+    if domain.is_empty() || domain.len() > 253 || !domain.chars().all(ok) {
+        return Err(FerronError::invalid_config(
+            "domains",
+            format!("invalid domain {domain:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_headers(field: &str, headers: &HashMap<String, String>) -> Result<()> {
+    for (name, value) in headers {
+        validate_header_name(field, name)?;
+        kdl_str(field, value)?;
+    }
+    Ok(())
+}
+
 /// Load balancing strategy for multiple backends
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,8 +243,12 @@ impl Backend {
     }
 
     /// Validate the backend configuration
+    ///
+    /// The URL must be `http`/`https` with a host, and header names must be
+    /// valid HTTP tokens with control-character-free values.
     pub fn validate(&self) -> Result<()> {
-        Url::parse(&self.url)?;
+        normalize_backend_url("backend.url", &self.url)?;
+        validate_headers("backend.headers", &self.headers)?;
         if self.weight == 0 {
             return Err(FerronError::invalid_config(
                 "weight",
@@ -195,6 +321,9 @@ impl LoadBalancer {
         for backend in &self.backends {
             backend.validate()?;
         }
+        if let Some(ref path) = self.health_check_path {
+            validate_route_path("health_check_path", path)?;
+        }
         Ok(())
     }
 }
@@ -257,6 +386,23 @@ impl Location {
     pub fn rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limit = Some(config);
         self
+    }
+
+    /// Validate the location: path syntax, proxy URL scheme, header names,
+    /// and that no value carries control characters.
+    pub fn validate(&self) -> Result<()> {
+        validate_route_path("location.path", &self.path)?;
+        if let Some(ref proxy) = self.proxy {
+            normalize_backend_url("location.proxy", proxy)?;
+        }
+        if let Some(ref root) = self.root {
+            kdl_str("location.root", root)?;
+        }
+        validate_headers("location.headers", &self.headers)?;
+        if let Some(ref rl) = self.rate_limit {
+            kdl_str("location.rate_limit.key", &rl.key)?;
+        }
+        Ok(())
     }
 }
 
@@ -414,6 +560,16 @@ impl ProxyRoute {
         self.timeout = Some(seconds);
         self
     }
+
+    /// Validate the route: path and prefix syntax and backend URL scheme.
+    pub fn validate(&self) -> Result<()> {
+        validate_route_path("route.path", &self.path)?;
+        normalize_backend_url("route.backend", &self.backend)?;
+        if let Some(ref prefix) = self.add_prefix {
+            validate_route_path("route.add_prefix", prefix)?;
+        }
+        Ok(())
+    }
 }
 
 /// Main Ferron configuration
@@ -503,6 +659,40 @@ impl FerronConfig {
             lb.validate()?;
         }
 
+        for domain in &self.domains {
+            validate_domain(domain)?;
+        }
+        for location in &self.locations {
+            location.validate()?;
+        }
+        for route in &self.routes {
+            route.validate()?;
+        }
+        validate_headers("headers", &self.headers)?;
+        if let Some(ref rl) = self.rate_limit {
+            kdl_str("rate_limit.key", &rl.key)?;
+        }
+        for (field, value) in [
+            ("access_log", &self.access_log),
+            ("error_log", &self.error_log),
+        ] {
+            if let Some(v) = value {
+                kdl_str(field, v)?;
+            }
+        }
+        if let Some(ref tls) = self.tls {
+            for (field, value) in [
+                ("tls.cert_path", &tls.cert_path),
+                ("tls.key_path", &tls.key_path),
+                ("tls.email", &tls.email),
+                ("tls.min_version", &tls.min_version),
+            ] {
+                if let Some(v) = value {
+                    kdl_str(field, v)?;
+                }
+            }
+        }
+
         if let Some(ref tls) = self.tls
             && !tls.auto
             && (tls.cert_path.is_none() || tls.key_path.is_none())
@@ -549,12 +739,17 @@ impl FerronConfig {
             if tls.auto {
                 writeln!(output, "    tls auto").map_err(|e| FerronError::config(e.to_string()))?;
                 if let Some(ref email) = tls.email {
-                    writeln!(output, "    tls_email \"{}\"", email)
+                    writeln!(output, "    tls_email {}", kdl_str("tls.email", email)?)
                         .map_err(|e| FerronError::config(e.to_string()))?;
                 }
             } else if let (Some(cert), Some(key)) = (&tls.cert_path, &tls.key_path) {
-                writeln!(output, "    tls \"{}\" \"{}\"", cert, key)
-                    .map_err(|e| FerronError::config(e.to_string()))?;
+                writeln!(
+                    output,
+                    "    tls {} {}",
+                    kdl_str("tls.cert_path", cert)?,
+                    kdl_str("tls.key_path", key)?
+                )
+                .map_err(|e| FerronError::config(e.to_string()))?;
             }
             if tls.hsts
                 && let Some(max_age) = tls.hsts_max_age
@@ -563,8 +758,12 @@ impl FerronConfig {
                     .map_err(|e| FerronError::config(e.to_string()))?;
             }
             if let Some(ref min_ver) = tls.min_version {
-                writeln!(output, "    tls_min_version \"{}\"", min_ver)
-                    .map_err(|e| FerronError::config(e.to_string()))?;
+                writeln!(
+                    output,
+                    "    tls_min_version {}",
+                    kdl_str("tls.min_version", min_ver)?
+                )
+                .map_err(|e| FerronError::config(e.to_string()))?;
             }
         }
 
@@ -584,27 +783,34 @@ impl FerronConfig {
         if self.logging
             && let Some(ref access_log) = self.access_log
         {
-            writeln!(output, "    log \"{}\"", access_log)
+            writeln!(output, "    log {}", kdl_str("access_log", access_log)?)
                 .map_err(|e| FerronError::config(e.to_string()))?;
         }
 
         if let Some(ref error_log) = self.error_log {
-            writeln!(output, "    error_log \"{}\"", error_log)
+            writeln!(output, "    error_log {}", kdl_str("error_log", error_log)?)
                 .map_err(|e| FerronError::config(e.to_string()))?;
         }
 
         // Global headers
         for (name, value) in &self.headers {
-            writeln!(output, "    header \"{}\" \"{}\"", name, value)
-                .map_err(|e| FerronError::config(e.to_string()))?;
+            writeln!(
+                output,
+                "    header {} {}",
+                kdl_str("headers", name)?,
+                kdl_str("headers", value)?
+            )
+            .map_err(|e| FerronError::config(e.to_string()))?;
         }
 
         // Rate limiting
         if let Some(ref rl) = self.rate_limit {
             writeln!(
                 output,
-                "    rate_limit key=\"{}\" rate={} burst={}",
-                rl.key, rl.requests_per_second, rl.burst
+                "    rate_limit key={} rate={} burst={}",
+                kdl_str("rate_limit.key", &rl.key)?,
+                rl.requests_per_second,
+                rl.burst
             )
             .map_err(|e| FerronError::config(e.to_string()))?;
         }
@@ -625,7 +831,7 @@ impl FerronConfig {
             if let Some(interval) = lb.health_check_interval {
                 let mut hc_line = format!("    lb_health_check interval={}", interval);
                 if let Some(ref path) = lb.health_check_path {
-                    hc_line.push_str(&format!(" path=\"{}\"", path));
+                    hc_line.push_str(&format!(" path={}", kdl_str("health_check_path", path)?));
                 }
                 if let Some(threshold) = lb.health_check_threshold {
                     hc_line.push_str(&format!(" threshold={}", threshold));
@@ -645,31 +851,44 @@ impl FerronConfig {
 
             writeln!(
                 output,
-                "    location \"{}\"{}  {{",
-                location.path, loc_attrs
+                "    location {}{}  {{",
+                kdl_str("location.path", &location.path)?,
+                loc_attrs
             )
             .map_err(|e| FerronError::config(e.to_string()))?;
 
             if let Some(ref proxy) = location.proxy {
-                writeln!(output, "        proxy \"{}\"", proxy)
-                    .map_err(|e| FerronError::config(e.to_string()))?;
+                let proxy = normalize_backend_url("location.proxy", proxy)?;
+                writeln!(
+                    output,
+                    "        proxy {}",
+                    kdl_str("location.proxy", &proxy)?
+                )
+                .map_err(|e| FerronError::config(e.to_string()))?;
             }
 
             if let Some(ref root) = location.root {
-                writeln!(output, "        root \"{}\"", root)
+                writeln!(output, "        root {}", kdl_str("location.root", root)?)
                     .map_err(|e| FerronError::config(e.to_string()))?;
             }
 
             for (name, value) in &location.headers {
-                writeln!(output, "        header \"{}\" \"{}\"", name, value)
-                    .map_err(|e| FerronError::config(e.to_string()))?;
+                writeln!(
+                    output,
+                    "        header {} {}",
+                    kdl_str("location.headers", name)?,
+                    kdl_str("location.headers", value)?
+                )
+                .map_err(|e| FerronError::config(e.to_string()))?;
             }
 
             if let Some(ref rl) = location.rate_limit {
                 writeln!(
                     output,
-                    "        rate_limit key=\"{}\" rate={} burst={}",
-                    rl.key, rl.requests_per_second, rl.burst
+                    "        rate_limit key={} rate={} burst={}",
+                    kdl_str("location.rate_limit.key", &rl.key)?,
+                    rl.requests_per_second,
+                    rl.burst
                 )
                 .map_err(|e| FerronError::config(e.to_string()))?;
             }
@@ -684,8 +903,13 @@ impl FerronConfig {
                 attrs.push_str(" remove_base=true");
             }
 
-            writeln!(output, "    location \"{}\"{}  {{", route.path, attrs)
-                .map_err(|e| FerronError::config(e.to_string()))?;
+            writeln!(
+                output,
+                "    location {}{}  {{",
+                kdl_str("route.path", &route.path)?,
+                attrs
+            )
+            .map_err(|e| FerronError::config(e.to_string()))?;
 
             // Rewrite the path (prepending the prefix) before proxying, using
             // Ferron's real `rewrite <regex> <replacement>` directive
@@ -706,12 +930,18 @@ impl FerronConfig {
             // examples use), and, like the old form, always matches (the
             // whole remaining path, greedily) so it applies unconditionally.
             if let Some(ref prefix) = route.add_prefix {
-                writeln!(output, "        rewrite \"^(.*)\" \"{}$1\"", prefix)
+                let replacement = kdl_str("route.add_prefix", &format!("{prefix}$1"))?;
+                writeln!(output, "        rewrite \"^(.*)\" {}", replacement)
                     .map_err(|e| FerronError::config(e.to_string()))?;
             }
 
-            writeln!(output, "        proxy \"{}\"", route.backend)
-                .map_err(|e| FerronError::config(e.to_string()))?;
+            let backend = normalize_backend_url("route.backend", &route.backend)?;
+            writeln!(
+                output,
+                "        proxy {}",
+                kdl_str("route.backend", &backend)?
+            )
+            .map_err(|e| FerronError::config(e.to_string()))?;
 
             if route.websocket {
                 writeln!(output, "        websocket")
@@ -745,7 +975,8 @@ impl FerronConfig {
 /// both the load-balanced (multi-backend) and single-backend `to_kdl()`
 /// paths so neither one silently drops backend options.
 fn write_backend_proxy(output: &mut String, indent: &str, backend: &Backend) -> Result<()> {
-    let mut proxy_line = format!("{}proxy \"{}\"", indent, backend.url);
+    let url = normalize_backend_url("backend.url", &backend.url)?;
+    let mut proxy_line = format!("{}proxy {}", indent, kdl_str("backend.url", &url)?);
     if backend.weight != 1 {
         proxy_line.push_str(&format!(" weight={}", backend.weight));
     }
@@ -769,8 +1000,10 @@ fn write_backend_proxy(output: &mut String, indent: &str, backend: &Backend) -> 
         for name in names {
             writeln!(
                 output,
-                "{}    header \"{}\" \"{}\"",
-                indent, name, backend.headers[name]
+                "{}    header {} {}",
+                indent,
+                kdl_str("backend.headers", name)?,
+                kdl_str("backend.headers", &backend.headers[name])?
             )
             .map_err(|e| FerronError::config(e.to_string()))?;
         }
@@ -1149,5 +1382,157 @@ mod tests {
 
         let kdl = config.to_kdl().unwrap();
         assert!(kdl.contains("rewrite \"^(.*)\" \"/v2$1\""), "kdl:\n{kdl}");
+    }
+
+    // -- M14: KDL injection ------------------------------------------------
+
+    fn base() -> FerronConfigBuilder {
+        FerronConfig::builder()
+            .domain("api.example.com")
+            .backend_url("http://localhost:3000")
+    }
+
+    fn rejected(builder: FerronConfigBuilder) -> bool {
+        builder.build().and_then(|c| c.to_kdl()).is_err()
+    }
+
+    #[test]
+    fn test_kdl_str_escapes_quotes_and_backslashes() {
+        assert_eq!(kdl_str("f", r#"a"b\c"#).unwrap(), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn test_kdl_str_rejects_control_characters() {
+        for bad in ["a\nb", "a\rb", "a\0b", "a\tb", "a\x1b[31mb"] {
+            assert!(kdl_str("f", bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_location_path_injection_is_rejected() {
+        assert!(rejected(
+            base().location(Location::new("/api\"\n    root \"/\""))
+        ));
+    }
+
+    #[test]
+    fn test_header_value_injection_is_rejected() {
+        assert!(rejected(base().header("X-Test", "v\"\n    root \"/\"")));
+    }
+
+    #[test]
+    fn test_header_value_quotes_are_escaped_not_injected() {
+        let config = base().header("X-Test", r#"v" root "/"#).build().unwrap();
+        let kdl = config.to_kdl().unwrap();
+        assert!(
+            kdl.contains(r#"header "X-Test" "v\" root \"/""#),
+            "kdl:\n{kdl}"
+        );
+        assert!(!kdl.contains("\n    root"), "kdl:\n{kdl}");
+    }
+
+    #[test]
+    fn test_invalid_header_name_is_rejected() {
+        assert!(rejected(base().header("X-A\" \"b", "v")));
+        let backend = Backend::new("http://localhost:3000").header("Bad Name", "v");
+        assert!(backend.validate().is_err());
+    }
+
+    #[test]
+    fn test_backend_url_injection_is_neutralized() {
+        // A quote in the URL is percent-encoded by the URL parser, and the
+        // normalized form is what gets emitted.
+        let config = FerronConfig::builder()
+            .domain("api.example.com")
+            .backend_url("http://localhost:3000/a\" root \"/")
+            .build()
+            .unwrap();
+        let kdl = config.to_kdl().unwrap();
+        assert!(!kdl.contains(" root "), "kdl:\n{kdl}");
+        assert!(kdl.contains("%22"), "kdl:\n{kdl}");
+
+        assert!(rejected(
+            FerronConfig::builder()
+                .domain("api.example.com")
+                .backend_url("http://localhost:3000\"\n root \"/")
+        ));
+    }
+
+    #[test]
+    fn test_backend_url_scheme_must_be_http_or_https() {
+        for url in ["file:///etc/passwd", "unix:/run/app.sock", "gopher://h/"] {
+            assert!(Backend::new(url).validate().is_err(), "{url}");
+            assert!(
+                ProxyRoute::new("/x", url).validate().is_err(),
+                "{url} as route backend"
+            );
+            assert!(
+                Location::new("/x").proxy(url).validate().is_err(),
+                "{url} as location proxy"
+            );
+        }
+        assert!(Backend::new("https://backend:8443").validate().is_ok());
+    }
+
+    #[test]
+    fn test_backend_url_emitted_in_normalized_form() {
+        let config = FerronConfig::builder()
+            .domain("api.example.com")
+            .backend_url("HTTP://LocalHost:3000/a/../b")
+            .build()
+            .unwrap();
+        let kdl = config.to_kdl().unwrap();
+        assert!(
+            kdl.contains("proxy \"http://localhost:3000/b\""),
+            "kdl:\n{kdl}"
+        );
+    }
+
+    #[test]
+    fn test_route_paths_and_prefix_are_validated() {
+        assert!(rejected(base().route(ProxyRoute::new(
+            "no-leading-slash",
+            "http://localhost:4000"
+        ))));
+
+        assert!(rejected(base().route(
+            ProxyRoute::new("/x", "http://localhost:4000").add_prefix("/v2\" {")
+        )));
+
+        assert!(rejected(base().route(
+            ProxyRoute::new("/x", "http://localhost:4000").add_prefix("/$2")
+        )));
+    }
+
+    #[test]
+    fn test_domain_injection_is_rejected() {
+        assert!(rejected(
+            FerronConfig::builder()
+                .domain("example.com {\n root \"/\"\n}\nevil.com")
+                .backend_url("http://localhost:3000")
+        ));
+    }
+
+    #[test]
+    fn test_tls_and_log_paths_are_escaped() {
+        assert!(rejected(
+            base().tls(TlsConfig::manual("/c\"ert", "/key\npem"))
+        ));
+
+        let config = base().error_log(r#"/var/log/"x".log"#).build().unwrap();
+        let kdl = config.to_kdl().unwrap();
+        assert!(
+            kdl.contains(r#"error_log "/var/log/\"x\".log""#),
+            "kdl:\n{kdl}"
+        );
+    }
+
+    #[test]
+    fn test_to_kdl_revalidates_fields_mutated_after_build() {
+        let mut config = base().build().unwrap();
+        config
+            .locations
+            .push(Location::new("/x").proxy("http://h\"\n root \"/"));
+        assert!(config.to_kdl().is_err());
     }
 }

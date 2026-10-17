@@ -1,6 +1,6 @@
 [package]
 name = "armature-ferron"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.94.1"
 authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
@@ -45,8 +45,6 @@ tempfile = "3.27"
 
 [features]
 default = []
-# Enable native TLS for health checks
-native-tls = ["reqwest/native-tls"]
 # Enable rustls for health checks
 rustls = ["reqwest/rustls"]
 

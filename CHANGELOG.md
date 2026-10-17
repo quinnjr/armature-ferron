@@ -9,6 +9,22 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** The `native-tls` feature is removed (it pulled in OpenSSL; Armature is rustls-only). Use `rustls`.
+
+### Security
+
+- KDL configuration injection: every value written into the generated Ferron config is now escaped as a KDL string (`"` and `\` escaped, control characters rejected). Backend URLs (default backend, load balancer, location `proxy`, route `backend`, registry instances) must be `http`/`https` with a host and are emitted in normalized `Url` form. Location/route paths and `add_prefix` must start with `/` and contain only printable ASCII without whitespace, quotes, backslashes, or `$`; header names must be RFC 9110 tokens; domains are restricted to hostname characters.
+
+### Added
+
+- `Location::validate` and `ProxyRoute::validate`.
+
+### Changed
+
+- **Breaking:** `FerronConfig::validate`/`to_kdl`, `Backend::validate`, and `ServiceRegistry::register`/`register_instance` now reject configurations they previously accepted (non-http(s) backend schemes, control characters, malformed paths/header names/domains). Migration: use `http://`/`https://` backends and plain absolute paths.
+
 ## [0.2.3] - 2026-09-15
 
 ### Changed
